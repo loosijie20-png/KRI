@@ -45,7 +45,6 @@ Major earthquakes pose a severe threat to coastal areas because they can trigger
 ├── earthquake.csv        # Main dataset: 1,000 major earthquakes, 19 columns
 ├── best_model.pkl        # Best model saved by the model selector (Random Forest)
 ├── requirements.txt      # Required Python packages
-├── report.pdf            # Written report
 └── README.md
 ```
 
