@@ -1,0 +1,866 @@
+---
+title: "MASA Hackathon"
+author: "Onzlah"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Data Preparation
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Required Packages
+
+```{r load-libraries}
+library(readxl)
+library(writexl)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(zoo)
+library(knitr)
+library(janitor)
+library(ggplot2)
+library(tidyverse)
+library(ggExtra)
+library(GGally)
+library(ggridges)
+library(ggcorrplot)
+library(scales)
+library(viridis)
+library(forecast)
+library(Metrics)
+library(gridExtra)
+```
+
+## Step 1: Initial Cleaning
+
+In this step, we read the data from the Excel file and perform several foundational cleaning tasks: \n
+1. We read the "Data" sheet directly, forcing columns to text initially to handle ".." easily. \n
+2. We remove the last 5 rows which contain metadata text instead of data. \n
+3. We replace the ".." values used by the World Bank with standard R `NA` values. \n
+4. Redundant columns (`Time Code`) are dropped. \n
+5. The `Time` column is parsed into an integer representing the year. \n
+6. All indicator columns (everything except Country Name, Country Code, and Time) are converted to numeric format. \n
+7. Finally, we clean up the indicator column names by stripping the bracketed WDI codes (e.g., `[EN.GHG.ALL.MT.CE.AR5]`), trimming trailing whitespace, and using `janitor::clean_names()` to standardize them into an easy-to-use snake_case format.
+
+```{r step-1-initial-cleaning}
+input_file <- "P_Data_Extract_From_World_Development_Indicators-6.xlsx"
+output_file <- "WDI_cleaned.xlsx"
+
+# Read the "Data" sheet, treating all columns as text initially
+df <- read_excel(input_file, sheet = "Data", col_types = "text")
+
+# Remove footer rows (delete the last 5 rows)
+df <- head(df, -5)
+
+# Replace ".." with NA
+df[df == ".."] <- NA
+
+# Remove the redundant "Time Code" column
+if ("Time Code" %in% names(df)) {
+  df <- df %>% select(-`Time Code`)
+}
+
+# Fix the Time column to integer
+if ("Time" %in% names(df)) {
+  df$Time <- as.integer(as.numeric(df$Time))
+}
+
+# Convert all indicator columns to numeric
+indicator_cols <- setdiff(names(df), c("Country Name", "Country Code", "Time"))
+df <- df %>%
+  mutate(across(all_of(indicator_cols), as.numeric))
+
+# Shorten column names by stripping bracketed WDI code
+names(df) <- str_replace(names(df), "\\s*\\[.*?\\]$", "")
+names(df) <- str_trim(names(df))
+
+# Standardise column names to snake_case format
+df <- janitor::clean_names(df)
+
+# --- ADDED: Incorporate Land Area Extract without changing original structure ---
+land_file <- "P_Data_Extract_From_World_Development_Indicators-7.xlsx"
+df_land <- read_excel(land_file, sheet = "Data", col_types = "text")
+df_land <- head(df_land, -5)
+df_land[df_land == ".."] <- NA
+if ("Time Code" %in% names(df_land)) df_land <- df_land %>% select(-`Time Code`)
+if ("Time" %in% names(df_land)) df_land$Time <- as.integer(as.numeric(df_land$Time))
+indicator_cols_land <- setdiff(names(df_land), c("Country Name", "Country Code", "Time"))
+df_land <- df_land %>% mutate(across(all_of(indicator_cols_land), as.numeric))
+names(df_land) <- str_replace(names(df_land), "\\s*\\[.*?\\]$", "")
+names(df_land) <- str_trim(names(df_land))
+df_land <- janitor::clean_names(df_land) %>%
+  rename(Land_Area = land_area_sq_km)
+
+# Merge datasets
+df <- df %>%
+  left_join(df_land, by = c("country_name", "country_code", "time"))
+
+# Specifically impute 2024 land area from 2023
+if ("Land_Area" %in% names(df)) {
+  df <- df %>%
+    arrange(country_name, time) %>%
+    group_by(country_name) %>%
+    mutate(Land_Area = if_else(time == 2024 & is.na(Land_Area), 
+                               lag(Land_Area), 
+                               Land_Area)) %>%
+    ungroup()
+}
+# -------------------------------------------------------------------------------
+
+# Reset row names
+rownames(df) <- NULL
+```
+
+## Step 2: Remove Specific Countries
+
+Before imputing missing data, it's critical to identify both countries and indicators with excessive missing values. We visualize the missingness by country and by indicator to inform our decision. /n
+
+As shown in the first plot below, Timor-Leste and Brunei Darussalam have excessively high rates of missing data across indicators. Because they are missing so much data, imputing values for them would be unreliable and could distort our analysis. We will drop all rows pertaining to these two countries.
+
+```{r step-2-visualise-and-remove, fig.width=10, fig.height=10}
+# Identify current indicator columns
+current_indicators <- setdiff(names(df), c("country_name", "country_code", "time"))
+
+# 1. Visualise missing values by country before dropping
+missing_by_country <- df %>%
+  group_by(country_name) %>%
+  summarise(
+    total_missing = sum(is.na(across(all_of(current_indicators)))),
+    total_cells = n() * length(current_indicators),
+    pct_missing = round((total_missing / total_cells) * 100, 2),
+    .groups = "drop"
+  )
+
+# Plot by country
+ggplot(missing_by_country, aes(x = reorder(country_name, pct_missing), y = pct_missing)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Percentage of Missing Indicator Values by Country",
+       x = "Country", y = "Missing Percentage (%)")
+
+# 2. Visualise missing values by indicator before dropping
+missing_by_var <- data.frame(
+  variable = current_indicators,
+  missing_count = colSums(is.na(df[, current_indicators])),
+  total_cells = nrow(df)
+) %>%
+  mutate(pct_missing = round((missing_count / total_cells) * 100, 2))
+
+# Plot by indicator
+ggplot(missing_by_var, aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Percentage of Missing Values by Indicator",
+       x = "Indicator", y = "Missing Percentage (%)")
+
+# Drop Timor-Leste and Brunei Darussalam
+df <- df %>% 
+  filter(!(country_name %in% c("Timor-Leste", "Brunei Darussalam")))
+
+cat("Rows remaining after dropping Timor-Leste and Brunei Darussalam:", nrow(df), "\n")
+```
+
+## Step 3: Special Domain-Specific Handling
+
+Before dropping columns with excessive missing data, we apply targeted, domain-specific rules to handle certain problematic variables: /n
+
+1.  **Market Capitalization**: For `market_capitalization_of_listed_domestic_companies_percent_of_gdp`, countries like Cambodia, Lao PDR, and Myanmar legitimately lack data because they do not have actively traded or large domestic stock markets for parts or all of the timeline. We will fill missing values with `0` for these countries and create a binary flag `has_active_stock_market`. /n
+2.  **External Debt**: For `external_debt_stocks_percent_of_gni`, Singapore and Malaysia are high-income or net-creditor nations. We will fill their missing values with `0` and create an `is_net_creditor_or_high_income` flag. /n
+3.  **Myanmar's Gross Capital Formation**: Myanmar lacks data for `gross_capital_formation_percent_of_gdp`. We will impute this by calculating the regional yearly mean of its neighbors (Cambodia, Lao PDR, and Viet Nam) and applying it to Myanmar.
+
+```{r step-3-domain-handling}
+# 1. Market Capitalization Handling
+mcap_col <- names(df)[str_detect(names(df), "(?i)market_capitalization.*gdp")]
+if (length(mcap_col) > 0) {
+  mcap_col <- mcap_col[1]
+  
+  # Robust regex match for countries
+  is_target_country <- str_detect(df$country_name, "(?i)Cambodia|Lao|Myanmar")
+  
+  # Direct base R replacement to guarantee values are forced to 0
+  df[[mcap_col]][is_target_country & is.na(df[[mcap_col]])] <- 0
+  df$has_active_stock_market <- if_else(df[[mcap_col]] > 0, 1, 0, missing = 0)
+}
+
+# 2. External Debt Handling
+edebt_col <- names(df)[str_detect(names(df), "(?i)external_debt_stocks.*gni")]
+if (length(edebt_col) > 0) {
+  edebt_col <- edebt_col[1]
+  
+  df <- df %>%
+    mutate(
+      !!sym(edebt_col) := case_when(
+        str_detect(country_name, "(?i)Singapore|Malaysia") ~ 0.0,
+        TRUE ~ as.numeric(!!sym(edebt_col))
+      ),
+      is_net_creditor_or_high_income = if_else(str_detect(country_name, "(?i)Singapore|Malaysia"), 1, 0)
+    )
+}
+
+# 3. Myanmar Gross Capital Formation Handling
+gcf_col <- names(df)[str_detect(names(df), "(?i)gross_capital_formation.*gdp")]
+if (length(gcf_col) > 0) {
+  gcf_col <- gcf_col[1]
+  
+  # Calculate yearly regional means
+  regional_means <- df %>%
+    filter(str_detect(country_name, "(?i)Cambodia|Lao|Viet Nam")) %>%
+    group_by(time) %>%
+    summarise(regional_gcf_mean = mean(.data[[gcf_col]], na.rm = TRUE), .groups = "drop")
+  
+  # Join and impute for Myanmar
+  df <- df %>%
+    left_join(regional_means, by = "time")
+    
+  is_myanmar <- str_detect(df$country_name, "(?i)Myanmar")
+  # Base R replacement
+  df[[gcf_col]][is_myanmar & is.na(df[[gcf_col]])] <- df$regional_gcf_mean[is_myanmar & is.na(df[[gcf_col]])]
+  
+  df <- df %>% select(-regional_gcf_mean)
+}
+```
+
+## Step 4: Drop High-Missing Columns (\>40% missing)
+
+If an indicator is missing more than 40% of its data overall, any imputation we attempt will likely be inaccurate. We calculate the missingness percentage for each remaining column, identify those with \>40% missing data, and drop them completely.
+
+We explicitly protect our special-case columns from being dropped in this step.
+
+```{r step-4-drop-high-missing}
+# Calculate missing percentage per column (using colMeans for robustness)
+missing_pct <- colMeans(is.na(df))
+
+# Identify columns to drop (> 40% missing)
+high_missing_cols <- names(which(missing_pct > 0.40))
+
+# Protect specially handled columns
+protected_cols <- c(
+  "market_capitalization_of_listed_domestic_companies_percent_of_gdp",
+  "external_debt_stocks_percent_of_gni",
+  "gross_capital_formation_percent_of_gdp"
+)
+high_missing_cols <- setdiff(high_missing_cols, protected_cols)
+
+cat("Columns dropped due to >40% missing data:\n")
+if (length(high_missing_cols) > 0) {
+  print(high_missing_cols)
+  # Drop the columns using any_of() to avoid exact-match errors
+  df <- df %>% select(-any_of(high_missing_cols))
+} else {
+  cat("None\n")
+}
+
+# For debugging: print the exact missing percentage of the columns mentioned
+target_cols <- c("central_government_debt_total_percent_of_gdp", 
+                 "market_capitalization_of_listed_domestic_companies_percent_of_gdp")
+cat("\nDiagnostic - Missing % for specific columns after Step 2:\n")
+for (col in target_cols) {
+  if (col %in% names(missing_pct)) {
+    cat(col, ": ", round(missing_pct[col] * 100, 2), "%\n", sep="")
+  } else {
+    cat(col, ": Column not found (might have been dropped or renamed differently)\n", sep="")
+  }
+}
+```
+
+## Step 5: Fill Medium-Missing Columns (20–40% missing)
+
+For columns with moderate missingness (between 20% and 40%), we use a Last Observation Carried Forward (LOCF) and Next Observation Carried Backward (NOCB) approach. By using `fill()` with the direction "downup", we can fill gaps using adjacent years. This is especially useful for slow-moving macroeconomic variables like external debt stocks, where adjacent years serve as reasonable proxies. **Crucially, we group by `country_name` and sort by `time` so that we never accidentally fill values across different countries.**
+
+```{r step-4-fill-medium-missing}
+# Recalculate missing percentage after dropping high-missing columns
+missing_pct <- colMeans(is.na(df))
+
+# Identify medium missing columns (20% to 40%)
+medium_missing_cols <- names(which(missing_pct >= 0.20 & missing_pct <= 0.40))
+
+cat("Columns treated with forward-fill and backward-fill (20%-40% missing):\n")
+print(medium_missing_cols)
+
+if (length(medium_missing_cols) > 0) {
+  df <- df %>%
+    arrange(country_name, time) %>%
+    group_by(country_name) %>%
+    fill(any_of(medium_missing_cols), .direction = "downup") %>%
+    ungroup()
+}
+```
+
+## Step 6: Linear Interpolation for Low-Missing Columns (\<20% missing)
+
+For columns with very little missing data (greater than 0% but less than 20%), we can use a more precise technique: linear interpolation (`zoo::na.approx`). This will estimate missing values by drawing a straight line between the known values before and after the gap. We perform this interpolation within each country group. To handle edge cases where a missing value occurs at the very beginning or end of a country's time series (where interpolation can't work because it lacks a bounding value), we follow up with one round of forward and backward filling.
+
+```{r step-5-interpolate-low-missing}
+# Recalculate missing percentage
+missing_pct <- colMeans(is.na(df))
+
+# Identify low missing columns (> 0% and < 20%)
+low_missing_cols <- names(which(missing_pct > 0 & missing_pct < 0.20))
+
+cat("Columns treated with linear interpolation (<20% missing):\n")
+print(low_missing_cols)
+
+# Safe interpolation function (needs at least 2 non-NA values to interpolate)
+safe_approx <- function(x) {
+  if (sum(!is.na(x)) >= 2) {
+    return(zoo::na.approx(x, na.rm = FALSE))
+  } else {
+    return(x)
+  }
+}
+
+if (length(low_missing_cols) > 0) {
+  df <- df %>%
+    arrange(country_name, time) %>%
+    group_by(country_name) %>%
+    mutate(across(any_of(low_missing_cols), safe_approx)) %>%
+    fill(any_of(low_missing_cols), .direction = "downup") %>%
+    ungroup()
+}
+```
+
+## Step 7: Summarise Remaining Missing Values
+
+After applying all of our targeted imputation strategies, we need to inspect the dataframe to see what missing data remains. We will display an overall table showing any columns that still contain `NA` values and another table showing the missing percentage for each country.
+
+```{r step-6-summarise-missing}
+# 1. Table of columns with remaining missing values
+remaining_missing <- sapply(df, function(x) sum(is.na(x)))
+remaining_missing_pct <- remaining_missing / nrow(df)
+
+missing_summary <- data.frame(
+  Column = names(df),
+  MissingCount = remaining_missing,
+  MissingPct = round(remaining_missing_pct * 100, 2)
+) %>%
+  filter(MissingCount > 0) %>%
+  arrange(desc(MissingCount))
+
+if (nrow(missing_summary) > 0) {
+  cat("Columns with remaining missing values:\n")
+  kable(missing_summary)
+} else {
+  cat("No missing values remain in any columns!\n")
+}
+
+# 2. Missing percentage per country
+# Identify the indicator columns in our current df
+current_indicator_cols <- setdiff(names(df), c("country_name", "country_code", "time"))
+
+country_missing <- df %>%
+  group_by(country_name) %>%
+  summarise(
+    TotalObservations = n() * length(current_indicator_cols),
+    TotalMissing = sum(is.na(across(all_of(current_indicator_cols)))),
+    MissingPct = round((TotalMissing / TotalObservations) * 100, 2),
+    .groups = "drop"
+  )
+
+cat("\nMissing percentage per country after cleaning:\n")
+kable(country_missing)
+```
+
+## Step 8: Export
+
+Finally, we export the fully cleaned dataset to an Excel file so it can be used for downstream analysis.
+
+```{r step-7-export}
+write_xlsx(df, output_file)
+cat("Cleaned dataset successfully saved to", output_file, "\n")
+```
+
+# EDA
+
+```{r}
+th_vn_colors <- c("Thailand" = "#0072B2", "Viet Nam" = "#D55E00")
+```
+
+```{r libraries}
+
+
+# Global helper function for markdown tables
+format_markdown_table <- function(data, caption = NULL, digits = 2) {
+  if (!is.null(caption)) {
+    cat(paste0("\n\n**Data Extraction: ", caption, "**\n"))
+  }
+  print(knitr::kable(data, format = 'markdown', digits = digits))
+}
+
+# Global helper function for column existence
+has_cols <- function(data, cols) {
+  all(cols %in% names(data))
+}
+
+# Set a professional global theme
+# Set a professional global theme
+theme_custom <- function() {
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey40"),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+}
+theme_set(theme_custom())
+```
+
+```{r load_data}
+# Ingest cleaned data
+df <- read_excel("WDI_cleaned.xlsx")
+
+# Ensure time is numeric
+df$time <- as.numeric(df$time)
+```
+
+## Part 1: Climate Hazard & Economic Exposure
+
+```{r yoy_growth_volatility, fig.width = 12, fig.height = 8}
+# Data Preparation: Calculate YoY Growth
+df_growth <- df %>%
+  arrange(country_name, time) %>%
+  group_by(country_name) %>%
+  mutate(
+    ghg_yoy_growth = ((total_greenhouse_gas_emissions_excluding_lulucf_mt_co2e - lag(total_greenhouse_gas_emissions_excluding_lulucf_mt_co2e)) / lag(total_greenhouse_gas_emissions_excluding_lulucf_mt_co2e)) * 100,
+    gdp_yoy_growth = ((gdp_per_capita_constant_2015_us - lag(gdp_per_capita_constant_2015_us)) / lag(gdp_per_capita_constant_2015_us)) * 100
+  ) %>%
+  ungroup() %>%
+  dplyr::filter(!is.na(ghg_yoy_growth) & !is.na(gdp_yoy_growth))
+
+# Visualization 1: GHG YoY Growth
+p_ghg <- ggplot(df_growth %>% dplyr::filter(country_name %in% c("Thailand", "Viet Nam")), aes(x = time, y = ghg_yoy_growth, color = country_name)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ country_name, scales = "free_y")  +
+  scale_color_manual(values = th_vn_colors) +
+    labs(
+    title = "Hazard Comparison: Thailand vs. Viet Nam",
+      subtitle = "YoY Growth in GHG Emissions",
+    x = "Year",
+    y = "YoY Growth (%)"
+  ) + theme(strip.text = element_text(face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_ghg)
+
+# Visualization 2: GDP YoY Growth
+p_gdp <- ggplot(df_growth %>% dplyr::filter(country_name %in% c("Thailand", "Viet Nam")), aes(x = time, y = gdp_yoy_growth, color = country_name)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ country_name, scales = "free_y")  +
+  scale_color_manual(values = th_vn_colors) +
+    labs(
+    title = "Hazard Comparison: Thailand vs. Viet Nam",
+      subtitle = "YoY Growth in GDP per Capita",
+    x = "Year",
+    y = "YoY Growth (%)"
+  ) + theme(strip.text = element_text(face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_gdp)
+
+# Output Exact Tables for 2020-2024
+df_recent <- df_growth %>% dplyr::filter(time >= 2020 & time <= 2024)
+
+ghg_table <- df_recent %>%
+  dplyr::select(country_name, time, ghg_yoy_growth) %>%
+  mutate(ghg_yoy_growth = round(ghg_yoy_growth, 2)) %>%
+  pivot_wider(names_from = time, values_from = ghg_yoy_growth)
+
+format_markdown_table(ghg_table, caption = "GHG YoY Growth (%) 2020-2024")
+
+gdp_table <- df_recent %>%
+  dplyr::select(country_name, time, gdp_yoy_growth) %>%
+  mutate(gdp_yoy_growth = round(gdp_yoy_growth, 2)) %>%
+  pivot_wider(names_from = time, values_from = gdp_yoy_growth)
+
+format_markdown_table(gdp_table, caption = "GDP YoY Growth (%) 2020-2024")
+```
+
+```{r energy_mix, fig.width=12, fig.height=10}
+col_fossil <- names(df)[str_detect(names(df), "electricity_production_from_oil_gas_and_coal")]
+col_hydro <- names(df)[str_detect(names(df), "electricity_production_from_hydroelectric")]
+col_renew <- names(df)[str_detect(names(df), "renewable_electricity_output")]
+
+if (length(col_fossil) > 0 & length(col_hydro) > 0 & length(col_renew) > 0) {
+  
+  df_energy <- df %>%
+    dplyr::select(country_name, time, fossil = all_of(col_fossil[1]), 
+           hydro = all_of(col_hydro[1]), renewable = all_of(col_renew[1])) %>%
+    pivot_longer(cols = c(fossil, hydro, renewable), names_to = "energy_source", values_to = "percentage")
+    
+  # Normalize to 100% just in case
+  df_energy <- df_energy %>%
+    group_by(country_name, time) %>%
+    mutate(percentage = percentage / sum(percentage, na.rm = TRUE) * 100)
+    
+  p4 <- ggplot(df_energy %>% dplyr::filter(country_name %in% c("Thailand", "Viet Nam")), aes(x = time, y = percentage, fill = energy_source)) +
+    geom_area(alpha = 0.8) +
+    facet_wrap(~country_name, ncol = 3)  +
+    scale_fill_viridis_d(option = "mako", name = "Energy Source") +
+    labs(
+      title = "Hazard Comparison: Thailand vs. Viet Nam",
+      subtitle = "Energy Transition Vulnerability - Reliance on fossil fuels represents a transition risk.",
+      x = "Year",
+      y = "Electricity Production Mix (%)",
+      fill = "Source"
+    )
+  print(p4)
+  
+  # Data Extraction: Exact energy mix in 2023
+  df_energy_2023 <- df_energy %>%
+    dplyr::filter(time == 2023) %>%
+    pivot_wider(names_from = energy_source, values_from = percentage) %>%
+    mutate(across(where(is.numeric), ~round(.x, 2)))
+    
+  format_markdown_table(df_energy_2023, caption = "Exact Energy Mix Percentages (2023)")
+  
+} else {
+  cat("Energy mix columns not found.\n")
+}
+```
+
+```{r renewable_transition, fig.width=12, fig.height=10}
+col_renew_total <- "renewable_energy_consumption_percent_of_total_final_energy_consumption"
+
+if (has_cols(df, col_renew_total)) {
+  p_renew <- ggplot(df %>% dplyr::filter(country_name %in% c("Thailand", "Viet Nam")), aes(x = time, y = .data[[col_renew_total]], fill = country_name)) +
+    geom_area(alpha = 0.6) +
+    geom_smooth(method = "lm", color = "black", linetype = "dashed", size = 0.5, se = FALSE) +
+    facet_wrap(~country_name)  +
+    scale_color_manual(values = th_vn_colors) + scale_fill_manual(values = th_vn_colors) +
+    labs(
+      title = "Hazard Comparison: Thailand vs. Viet Nam",
+      subtitle = "Renewable Energy Transition Trends - Transition Risk Mitigation: Growth in Renewable Energy Consumption (1999-2024)",
+      x = "Year",
+      y = "Renewable Energy Consumption (%)"
+    )
+  print(p_renew)
+  
+  # Data Extraction: Renewable Energy % for 2000, 2010, 2020, 2024
+  df_renew_ext <- df %>%
+    dplyr::filter(time %in% c(2000, 2010, 2020, 2024)) %>%
+    dplyr::select(country_name, time, all_of(col_renew_total)) %>%
+    pivot_wider(names_from = time, values_from = all_of(col_renew_total)) %>%
+    mutate(across(where(is.numeric), ~round(.x, 2)))
+    
+  format_markdown_table(df_renew_ext, caption = "Renewable Energy % (2000, 2010, 2020, 2024)")
+} else {
+  cat("Renewable energy column not found.\n")
+}
+```
+
+## Part 2: Catastrophe Risk Analysis (EM-DAT)
+
+```{r emdat_data, include=FALSE}
+# Load the EM-DAT dataset
+emdat <- read_excel("thailand_vietnam_emdat_annual_disaster_trends.xlsx", skip = 2)
+
+# Extract the exact columns by index (7 to 11) to avoid duplicate column name errors
+df_emdat <- emdat %>%
+  dplyr::select(7:11) %>%
+  setNames(c("year", "th_loss", "vn_loss", "th_events", "vn_events")) %>%
+  dplyr::filter(!is.na(year)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  mutate(across(everything(), ~replace_na(.x, 0)))
+
+# Reshape for ggplot
+df_freq <- df_emdat %>%
+  dplyr::select(year, Thailand = th_events, `Viet Nam` = vn_events) %>%
+  pivot_longer(-year, names_to = "country", values_to = "events")
+
+df_loss <- df_emdat %>%
+  dplyr::select(year, Thailand = th_loss, `Viet Nam` = vn_loss) %>%
+  pivot_longer(-year, names_to = "country", values_to = "loss")
+
+df_intensity <- df_emdat %>%
+  mutate(
+    Thailand = if_else(th_events > 0, th_loss / th_events, 0),
+    `Viet Nam` = if_else(vn_events > 0, vn_loss / vn_events, 0)
+  ) %>%
+  dplyr::select(year, Thailand, `Viet Nam`) %>%
+  pivot_longer(-year, names_to = "country", values_to = "severity_per_event")
+```
+
+```{r freq_analysis, fig.width=12, fig.height=8}
+# Calculate long-term mean
+mean_events <- df_freq %>% group_by(country) %>% summarize(avg = mean(events))
+
+p_freq <- ggplot(df_freq, aes(x = year, y = events, fill = country)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(data = mean_events, aes(yintercept = avg, color = country), linetype = "dashed", size = 1) +
+  facet_wrap(~country, ncol = 1) +
+  scale_color_manual(values = th_vn_colors) + scale_fill_manual(values = th_vn_colors) +
+    labs(
+    title = "Hazard Comparison: Thailand vs. Viet Nam",
+      subtitle = "Natural Disaster Frequency (2000-2024) - Physical Risk: Dashed line represents the long-term historical mean.",
+    x = "Year",
+    y = "Number of Disaster Events"
+  ) +
+  theme(strip.text = element_text(face = "bold"))
+print(p_freq)
+```
+
+**Actuarial Interpretation**: The frequency of events visually indicates a persistent "Physical Risk." Viet Nam shows a highly recurring, frequency-driven pattern, consistently hitting or exceeding its long-term average, suggesting that catastrophe exposure is a chronic issue requiring sustained capital reserves. Thailand's events appear slightly more episodic but also show high-frequency years exceeding the historical baseline.
+
+```{r loss_analysis, fig.width=12, fig.height=8}
+p_loss <- ggplot(df_loss, aes(x = year, y = loss, color = country, group = country)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_y_log10(labels = scales::comma, expand = expansion(mult = c(0.05, 0.3))) + # Expand top margin so Thailand's massive outlier label isn't clipped
+  facet_wrap(~country, ncol = 1) +
+  # Label highest year
+  geom_text(
+    data = df_loss %>% group_by(country) %>% slice_max(loss, n = 1, with_ties = FALSE),
+    aes(label = paste(year, "-", scales::comma(loss), "m")), 
+    vjust = -1, color = "darkred", fontface = "bold"
+  ) +
+  scale_color_manual(values = th_vn_colors) +
+    labs(
+    title = "Hazard Comparison: Thailand vs. Viet Nam",
+      subtitle = "Total Economic Loss Trends (Log Scale) - Financial Impact Assessment: Spikes highlight catastrophic years triggering reinsurance payouts.",
+    x = "Year",
+    y = "Total Economic Loss (USD m, Log Scale)"
+  ) +
+  theme(strip.text = element_text(face = "bold"))
+print(p_loss)
+```
+
+**Actuarial Interpretation**: This "Financial Impact Assessment" identifies peak severity years. Thailand’s 2011 floods dominate the scale, representing an immense tail-risk event that likely triggered top-layer reinsurance layers across the market. Viet Nam shows high severity in recent years (2015, 2017, 2024), indicating that while frequency is high, severity is also capable of causing significant shocks to local portfolios.
+
+```{r intensity_analysis, fig.width=12, fig.height=8}
+p_intensity <- ggplot(df_intensity, aes(x = year, y = severity_per_event, color = country, group = country)) +
+  geom_line(alpha = 0.5, size = 1) +
+  geom_smooth(method = "loess", se = FALSE, size = 1.5, linetype = "dashed") +
+  facet_wrap(~country, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = th_vn_colors) +
+    labs(
+    title = "Hazard Comparison: Thailand vs. Viet Nam",
+      subtitle = "Loss Intensity: Average Severity per Event - Vulnerability: Are individual disasters becoming more costly?",
+    x = "Year",
+    y = "Average Loss per Event (USD m)"
+  ) +
+  theme(strip.text = element_text(face = "bold"))
+print(p_intensity)
+```
+
+**Actuarial Interpretation**: Investigating "Vulnerability" reveals the underlying intensity trajectory. Spikes in average severity per event (like Thailand in 2011) suggest that when disasters do hit, they are impacting highly concentrated areas of economic value. If the dashed smoothing trendline slopes upward over time, it implies that urbanization and asset concentration are causing individual events to become substantially more costly, necessitating pricing adjustments in natural catastrophe models.
+
+# Predictive Modelling
+
+## a. Setup and Data Loading
+
+First, we load the required packages and the cleaned World Development Indicators (WDI) dataset containing the land area variable.
+
+```{r}
+# Load the dataset
+df_raw <- read_excel("WDI_cleaned.xlsx")
+
+# Target countries for the analysis
+countries <- c("Thailand", "Viet Nam")
+
+# Filter, select required predictors, and rename for cleaner syntax
+df <- df_raw %>%
+  filter(country_name %in% countries & time >= 1999 & time <= 2024) %>%
+  select(
+    Country       = country_name,
+    Year          = time,
+    Total_GHG     = total_greenhouse_gas_emissions_excluding_lulucf_mt_co2e,
+    GDP_per_Capita= gdp_per_capita_constant_2015_us,
+    Pop_Density   = population_density_people_per_sq_km_of_land_area,
+    Land_Area     = Land_Area,
+    Renewable     = renewable_energy_consumption_percent_of_total_final_energy_consumption,
+    EnergyInt     = energy_intensity_level_of_primary_energy_mj_2021_ppp_gdp,
+    Forest        = forest_area_percent_of_land_area,
+    Manufacturing = manufacturing_value_added_percent_of_gdp
+  ) %>%
+  arrange(Country, Year)
+```
+
+## b. Feature Engineering
+
+We reconstruct Total Population and Total GDP, and then calculate our primary target variables: GHG per GDP and GHG per Billion GDP.
+
+```{r}
+df <- df %>%
+  mutate(
+    # Reconstruct Total Population (People/sq.km * sq.km = Total People)
+    Population = Pop_Density * Land_Area,
+    
+    # Reconstruct Total GDP (Constant 2015 USD)
+    Total_GDP = GDP_per_Capita * Population,
+    
+    # Target Construction: Mt CO2e per Billion Constant 2015 USD GDP
+    GHG_per_GDP = Total_GHG / Total_GDP,
+    GHG_per_Billion_GDP = Total_GHG / (Total_GDP / 1e9)
+  )
+
+```
+
+## c. Modelling Preparation
+
+We log-transform our target, create within-country lags, forward-fill missing 2024 predictors, and define our training, validation, and test splits.
+
+```{r}
+df <- df %>%
+  group_by(Country) %>%
+  mutate(
+    log_GHG_per_GDP = log(GHG_per_Billion_GDP),
+    lag_log_GHG_per_GDP = dplyr::lag(log_GHG_per_GDP, 1)
+  ) %>%
+  fill(Renewable, EnergyInt, Forest, Manufacturing, .direction = "down") %>%
+  ungroup()
+
+train_data <- df %>% filter(Year >= 1999 & Year <= 2018) %>% drop_na(log_GHG_per_GDP, lag_log_GHG_per_GDP)
+val_data   <- df %>% filter(Year >= 2019 & Year <= 2023)
+test_2024  <- df %>% filter(Year == 2024)
+```
+
+## d. Model Training
+
+### Log-Linear Panel Fixed Effects
+
+We fit three models: a Log-Linear Panel Fixed Effects model, a Dynamic Panel Fixed Effects model, and a baseline Country-wise ARIMA model.
+
+```{r}
+# Model 1: Panel FE
+mod1 <- lm(log_GHG_per_GDP ~ Renewable + EnergyInt + Forest + Manufacturing + Year + factor(Country), data = train_data)
+summary(mod1)
+```
+
+### Dynamic Panel Fixed Effects (Includes lag_log_GHG)
+
+```{r}
+# Model 2: Dynamic Panel FE
+mod2 <- lm(log_GHG_per_GDP ~ lag_log_GHG_per_GDP + Renewable + EnergyInt + Forest + Manufacturing + Year + factor(Country), data = train_data)
+summary(mod2)
+```
+
+### ARIMA Benchmark
+
+```{r}
+# Model 3: ARIMA
+arima_models <- list()
+for (c in countries) {
+  ts_train <- train_data %>% filter(Country == c) %>% pull(log_GHG_per_GDP)
+  fit <- auto.arima(ts_train)
+  arima_models[[c]] <- fit
+  cat(sprintf("Country: %-12s | Order: %-12s | AIC: %.2f | BIC: %.2f\n", 
+              c, paste(arimaorder(fit), collapse=","), fit$aic, fit$bic))
+}
+```
+
+## e. Validation & Diagnostics
+
+We test the models on the 2019-2023 validation period. For Model 2, we dynamically iterate the lag to prevent data leakage.
+
+```{r}
+val_data$M1_log <- predict(mod1, newdata = val_data)
+
+val_data$M2_log <- NA
+for (c in countries) {
+  last_pred <- train_data %>% filter(Country == c) %>% pull(log_GHG_per_GDP) %>% tail(1)
+  idx <- which(val_data$Country == c)
+  
+  for (i in idx) {
+    val_data$lag_log_GHG_per_GDP[i] <- last_pred
+    current_pred <- predict(mod2, newdata = val_data[i, ])
+    val_data$M2_log[i] <- current_pred
+    last_pred <- current_pred 
+  }
+}
+
+val_data$M3_log <- NA
+for (c in countries) {
+  fc <- forecast(arima_models[[c]], h = 5)
+  val_data$M3_log[val_data$Country == c] <- as.numeric(fc$mean)
+}
+
+val_data <- val_data %>%
+  mutate(
+    Actual_Intensity = exp(log_GHG_per_GDP),
+    M1_pred = exp(M1_log), M2_pred = exp(M2_log), M3_pred = exp(M3_log)
+  )
+
+get_metrics <- function(act, pred) {
+  c(RMSE = rmse(act, pred), MAE = mae(act, pred), MAPE = mape(act, pred)*100, R2 = cor(act, pred)^2)
+}
+
+overall_val <- rbind(
+  M1_PanelFE = get_metrics(val_data$Actual_Intensity, val_data$M1_pred),
+  M2_Dynamic = get_metrics(val_data$Actual_Intensity, val_data$M2_pred),
+  M3_ARIMA   = get_metrics(val_data$Actual_Intensity, val_data$M3_pred)
+)
+print(round(overall_val, 4))
+```
+
+### Country-level Metrics Extraction
+
+```{r}
+country_mape <- val_data %>% group_by(Country) %>%
+  summarise(M1_MAPE = mape(Actual_Intensity, M1_pred)*100,
+            M2_MAPE = mape(Actual_Intensity, M2_pred)*100,
+            M3_MAPE = mape(Actual_Intensity, M3_pred)*100)
+print(country_mape)
+```
+
+## f. Final 2024 Forecasts
+
+```{r}
+# Predict 2024 values using Model 1
+test_2024$M2_log <- predict(mod2, newdata = test_2024)
+
+# Back-transform from log scale and calculate the Intensity Index
+final_2024 <- test_2024 %>%
+  mutate(
+    M2_Pred_GHG_GDP = exp(M2_log),
+  ) %>%
+  select(Country, Year, M2_Pred_GHG_GDP)
+
+# Merge final 2024 forecast with actual GHG per Billion GDP
+actual_2024_intensity <- df %>%
+  filter(Year == 2024) %>%
+  dplyr::select(Country, Year, GHG_per_Billion_GDP)
+
+final_2024_compare <- final_2024 %>%
+  left_join(
+    actual_2024_intensity,
+    by = c("Country", "Year")
+  )
+
+print(final_2024_compare)
+
+final_2024_compare <- final_2024 %>%
+  left_join(
+    df %>%
+      filter(Year == 2024) %>%
+      dplyr::select(Country, Year, GHG_per_Billion_GDP),
+    by = c("Country", "Year")
+  ) %>%
+  mutate(
+    Error_GHG_per_Billion_GDP = M2_Pred_GHG_GDP - GHG_per_Billion_GDP
+  )
+
+print(final_2024_compare)
+```
+
+#### Diagnostics Plots
+
+```{r}
+par(mfrow = c(2, 2))
+
+plot(mod2)
+
+par(mfrow = c(1, 1))
+```
