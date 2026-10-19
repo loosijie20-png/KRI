@@ -1,0 +1,22 @@
+# SIT3020 Python for Data Science — required packages
+# Install all:  pip install -r requirements.txt
+
+# Core data science stack
+numpy>=1.23.0
+pandas>=1.5.0
+matplotlib>=3.6.0
+scipy>=1.9.0
+seaborn>=0.13.2
+
+# Machine learning
+scikit-learn>=1.2.0
+mglearn>=0.1.9
+imbalanced-learn>=0.12.0
+
+# File format support
+openpyxl>=3.0.10
+pyarrow>=10.0.0
+
+# Jupyter environment
+jupyter>=1.0.0
+ipykernel>=6.0.0
