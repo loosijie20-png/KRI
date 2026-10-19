@@ -4,7 +4,7 @@
 
 **Context**
 
-Submitted in fulfilment of the course SIT3020 Python for Data Science, Universiti Malaya, Academic Session 2025/2026, Semester II. A group project involving 6 members.
+Submitted in fulfilment of the course SIT3020 Python for Data Science, Universiti Malaya, Academic Session 2025/2026, Semester II. A group project involving 6 members. The IPYNB notebook contains coding script, output and corresponding explanation.
 
 **Problem statement**
 
